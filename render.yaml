@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: medassist-rag-backend
+    env: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: SUPABASE_URL
+        fromDatabase: false
+        value: https://smybetwoumsiqtwpirvi.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false   # set manually in Render dashboard
+      - key: GROQ_API_KEY
+        sync: false   # set manually in Render dashboard
+    disk:
+      name: model-cache
+      mountPath: /opt/render/project/src/rag-backend/.cache
+      sizeGB: 1
