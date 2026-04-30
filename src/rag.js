@@ -161,55 +161,204 @@ async function embedQuery(query) {
   }
 }
 
-// ─── STEP 3a: VECTOR RETRIEVAL ────────────────────────────────────────────────
+// ─── STEP 3a: ENHANCED VECTOR RETRIEVAL ────────────────────────────────────────
 
-async function vectorRetrieve(queryEmbedding, topK = 15) {
+async function vectorRetrieve(queryEmbedding, topK = 25) { // Increased for better recall
   if (!queryEmbedding) return [];
 
-  const { data, error } = await supabase.rpc('match_chunks', {
-    query_embedding: queryEmbedding,
-    match_count: topK,
-  });
+  // Try the vector function first
+  try {
+    const { data, error } = await supabase.rpc('match_chunks', {
+      query_embedding: queryEmbedding,
+      match_count: topK,
+      similarity_threshold: 0.1
+    });
 
-  if (!error && data && data.length > 0) {
-    console.log(`[RAG] Vector: ${data.length} chunks, top sim: ${data[0].similarity?.toFixed(3)}`);
-    return data;
+    if (!error && data && data.length > 0) {
+      console.log(`[RAG] Vector: ${data.length} chunks, top sim: ${data[0].similarity?.toFixed(3)}, avg: ${(data.reduce((sum, r) => sum + (r.similarity || 0), 0) / data.length).toFixed(3)}`);
+      return data;
+    }
+  } catch (err) {
+    console.warn('[RAG] Vector function failed:', err.message);
   }
 
-  if (error) console.warn('[RAG] Vector search error:', error.message);
-  return await ftsFallback(queryEmbedding, topK);
+  // Fallback to direct similarity calculation
+  console.log('[RAG] Using direct similarity fallback...');
+  return await directVectorSearch(queryEmbedding, topK);
 }
 
-// ─── STEP 3b: KEYWORD (BM25-style) RETRIEVAL ─────────────────────────────────
-// Uses Postgres full-text search as a second retrieval path
+async function directVectorSearch(queryEmbedding, topK) {
+  // Get all chunks with embeddings
+  const { data: chunks, error } = await supabase
+    .from('medical_chunks')
+    .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
+    .not('embedding', 'is', null)
+    .limit(1000); // Limit to prevent memory issues
 
-async function keywordRetrieve(query, topK = 15) {
-  // Extract meaningful medical terms (skip stopwords)
+  if (error || !chunks || chunks.length === 0) {
+    console.warn('[RAG] Direct vector search failed:', error?.message || 'No chunks found');
+    return await ftsFallback(queryEmbedding, topK);
+  }
+
+  // Calculate similarities
+  const scored = chunks.map(c => {
+    try {
+      const emb = typeof c.embedding === 'string' ? JSON.parse(c.embedding) : c.embedding;
+      if (!emb || !Array.isArray(emb) || emb.length !== queryEmbedding.length) {
+        return { ...c, similarity: 0 };
+      }
+      return { ...c, similarity: cosineSim(queryEmbedding, emb) };
+    } catch (err) {
+      return { ...c, similarity: 0 };
+    }
+  });
+
+  // Sort by similarity and return top results
+  scored.sort((a, b) => b.similarity - a.similarity);
+  const results = scored.slice(0, topK);
+  
+  console.log(`[RAG] Direct vector: ${results.length} chunks, top sim: ${results[0]?.similarity?.toFixed(3)}, avg: ${results.length > 0 ? (results.reduce((sum, r) => sum + r.similarity, 0) / results.length).toFixed(3) : 0}`);
+  
+  return results;
+}
+
+// ─── STEP 3b: ENHANCED KEYWORD (BM25-style) RETRIEVAL ─────────────────────────
+// Uses Postgres full-text search as a second retrieval path with better medical term handling
+
+async function keywordRetrieve(query, topK = 25) { // Increased for better recall
+  // Enhanced medical term extraction with comprehensive medical vocabulary
   const stopwords = new Set(['i','me','my','the','a','an','is','are','was','were','have','has','do','does','can','could','would','should','what','how','why','when','where','which','this','that','these','those','and','or','but','for','with','about','from','to','of','in','on','at','by','as','it','its','be','been','being','am','will','shall','may','might','must','need','used','get','got','feel','feeling','having','been','very','so','just','also','more','some','any','all','no','not','than','then','there','here','up','down','out','off','over','under','again','further','once']);
 
-  const terms = query.toLowerCase()
+  // Comprehensive medical synonym expansion
+  const medicalExpansions = {
+    'fever': ['fever', 'pyrexia', 'temperature', 'febrile', 'hyperthermia'],
+    'headache': ['headache', 'cephalgia', 'migraine', 'head pain', 'cranial pain'],
+    'pain': ['pain', 'ache', 'discomfort', 'soreness', 'tenderness', 'hurt'],
+    'stomach': ['stomach', 'abdominal', 'gastric', 'belly', 'tummy', 'abdomen'],
+    'heart': ['heart', 'cardiac', 'cardiovascular', 'coronary', 'myocardial'],
+    'breathing': ['breathing', 'respiratory', 'dyspnea', 'breathless', 'respiration'],
+    'diabetes': ['diabetes', 'diabetic', 'blood sugar', 'glucose', 'insulin'],
+    'blood pressure': ['hypertension', 'hypotension', 'blood pressure', 'BP'],
+    'infection': ['infection', 'bacterial', 'viral', 'fungal', 'pathogen', 'sepsis'],
+    'allergy': ['allergy', 'allergic', 'hypersensitivity', 'anaphylaxis', 'reaction'],
+    'cough': ['cough', 'coughing', 'bronchitis', 'respiratory', 'wheeze'],
+    'rash': ['rash', 'skin', 'dermatitis', 'eczema', 'urticaria', 'hives'],
+    'fatigue': ['fatigue', 'tired', 'weakness', 'exhaustion', 'lethargy'],
+    'nausea': ['nausea', 'vomiting', 'emesis', 'queasiness', 'sick'],
+    'diarrhea': ['diarrhea', 'loose stool', 'gastroenteritis', 'bowel'],
+    'joint': ['joint', 'arthritis', 'rheumatoid', 'articular', 'synovial'],
+    'throat': ['throat', 'pharyngitis', 'tonsillitis', 'laryngitis', 'sore throat']
+  };
+
+  // Extract and expand terms
+  let expandedTerms = [];
+  const originalTerms = query.toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(t => t.length > 2 && !stopwords.has(t));
 
-  if (terms.length === 0) return [];
-
-  // Build tsquery: term1 | term2 | term3
-  const tsQuery = terms.slice(0, 8).join(' | ');
-
-  const { data, error } = await supabase
-    .from('medical_chunks')
-    .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
-    .textSearch('content', tsQuery, { type: 'websearch', config: 'english' })
-    .limit(topK);
-
-  if (error) {
-    console.warn('[RAG] Keyword search error:', error.message);
-    return [];
+  for (const term of originalTerms) {
+    expandedTerms.push(term);
+    
+    // Add medical expansions
+    for (const [key, expansions] of Object.entries(medicalExpansions)) {
+      if (term.includes(key) || key.includes(term)) {
+        expandedTerms.push(...expansions);
+      }
+    }
   }
 
-  console.log(`[RAG] Keyword: ${(data || []).length} chunks`);
-  return (data || []).map((c, i) => ({ ...c, similarity: 1 - (i / topK) * 0.5 }));
+  // Remove duplicates and limit terms
+  expandedTerms = [...new Set(expandedTerms)].slice(0, 15);
+
+  if (expandedTerms.length === 0) return [];
+
+  // Multi-strategy keyword search with better error handling
+  const strategies = [
+    // Strategy 1: Simple OR matching for maximum recall
+    expandedTerms.slice(0, 8).join(' | '),
+    // Strategy 2: Individual term matching
+    expandedTerms.slice(0, 6).join(' | '),
+    // Strategy 3: Partial matching with wildcards
+    expandedTerms.slice(0, 4).map(t => `${t}:*`).join(' | ')
+  ];
+
+  let allResults = [];
+  const seenIds = new Set();
+
+  for (let i = 0; i < strategies.length; i++) {
+    const tsQuery = strategies[i];
+    
+    try {
+      // Use ilike for simpler text matching as fallback
+      const { data: textResults, error: textError } = await supabase
+        .from('medical_chunks')
+        .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
+        .or(expandedTerms.slice(0, 5).map(term => `content.ilike.%${term}%`).join(','))
+        .limit(Math.ceil(topK / 2));
+
+      if (!textError && textResults) {
+        for (let j = 0; j < textResults.length; j++) {
+          const chunk = textResults[j];
+          if (!seenIds.has(chunk.id)) {
+            seenIds.add(chunk.id);
+            
+            // Enhanced scoring based on term frequency and medical relevance
+            const content = chunk.content.toLowerCase();
+            let termScore = 0;
+            let medicalBonus = 0;
+            
+            for (const term of expandedTerms) {
+              const termCount = (content.match(new RegExp(term, 'g')) || []).length;
+              termScore += termCount;
+              
+              // Medical terms get bonus
+              if (['fever', 'pain', 'headache', 'diabetes', 'heart', 'infection'].includes(term)) {
+                medicalBonus += 0.2;
+              }
+            }
+            
+            const similarity = Math.min(1, (termScore * 0.1 + medicalBonus + (1 - j / textResults.length * 0.3)));
+            
+            allResults.push({ ...chunk, similarity });
+          }
+        }
+      }
+
+      // Also try full-text search if available
+      try {
+        const { data: ftsResults, error: ftsError } = await supabase
+          .from('medical_chunks')
+          .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
+          .textSearch('content', tsQuery, { type: 'websearch', config: 'english' })
+          .limit(Math.ceil(topK / 2));
+
+        if (!ftsError && ftsResults) {
+          for (let j = 0; j < ftsResults.length; j++) {
+            const chunk = ftsResults[j];
+            if (!seenIds.has(chunk.id)) {
+              seenIds.add(chunk.id);
+              const similarity = 1 - (j / ftsResults.length * 0.4); // FTS gets higher base score
+              allResults.push({ ...chunk, similarity });
+            }
+          }
+        }
+      } catch (ftsErr) {
+        // FTS might not be available, continue with text search results
+      }
+
+    } catch (error) {
+      console.warn(`[RAG] Keyword strategy ${i + 1} failed:`, error.message);
+    }
+  }
+
+  // Sort by similarity and return top results
+  allResults.sort((a, b) => b.similarity - a.similarity);
+  const finalResults = allResults.slice(0, topK);
+  
+  console.log(`[RAG] Keyword: ${finalResults.length} chunks, strategies used: ${strategies.length}, avg score: ${finalResults.length > 0 ? (finalResults.reduce((sum, r) => sum + r.similarity, 0) / finalResults.length).toFixed(3) : 0}`);
+  
+  return finalResults;
 }
 
 // ─── STEP 3c: FTS FALLBACK ────────────────────────────────────────────────────
@@ -248,20 +397,41 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-10);
 }
 
-// ─── STEP 4: RECIPROCAL RANK FUSION (RRF) ────────────────────────────────────
-// Merges two ranked lists (vector + keyword) into one unified ranking.
-// RRF score = Σ 1 / (k + rank_i)  where k=60 is a smoothing constant.
+// ─── STEP 4: ENHANCED RECIPROCAL RANK FUSION (RRF) ───────────────────────────
+// Advanced RRF with medical relevance weighting and source diversity
 
-function reciprocalRankFusion(lists, k = 60) {
-  const scores = new Map(); // id → { score, chunk }
+function reciprocalRankFusion(lists, k = 50) { // Reduced k for stronger ranking influence
+  const scores = new Map(); // id → { score, chunk, sources }
 
-  for (const list of lists) {
+  // Weight different retrieval methods
+  const listWeights = [1.2, 1.0]; // Vector search gets slight preference
+
+  for (let listIdx = 0; listIdx < lists.length; listIdx++) {
+    const list = lists[listIdx];
+    const weight = listWeights[listIdx] || 1.0;
+    
     list.forEach((chunk, rank) => {
       const id = String(chunk.id || chunk.doc_id);
-      const prev = scores.get(id) || { score: 0, chunk };
+      const prev = scores.get(id) || { score: 0, chunk, sources: new Set() };
+      
+      // Enhanced RRF with medical category bonuses
+      let categoryBonus = 0;
+      if (chunk.category === 'disease') categoryBonus = 0.15;
+      else if (chunk.category === 'qa') categoryBonus = 0.1;
+      else if (chunk.category === 'emergency') categoryBonus = 0.2;
+      
+      // Source diversity bonus
+      const sourceBonus = prev.sources.has(chunk.source) ? 0 : 0.05;
+      prev.sources.add(chunk.source);
+      
+      // Calculate enhanced RRF score
+      const rrfScore = weight / (k + rank + 1);
+      const enhancedScore = rrfScore + categoryBonus + sourceBonus;
+      
       scores.set(id, {
-        score: prev.score + 1 / (k + rank + 1),
-        chunk: { ...prev.chunk, ...chunk }, // merge fields
+        score: prev.score + enhancedScore,
+        chunk: { ...prev.chunk, ...chunk }, // merge fields, prefer later
+        sources: prev.sources
       });
     });
   }
@@ -271,115 +441,314 @@ function reciprocalRankFusion(lists, k = 60) {
     .map(({ score, chunk }) => ({ ...chunk, rrfScore: score }));
 }
 
-// ─── STEP 5: CROSS-ENCODER RE-RANKING ────────────────────────────────────────
-// Lightweight lexical cross-encoder: scores each chunk by term overlap with query.
-// A true neural cross-encoder would be ideal but this is fast and effective.
+// ─── STEP 5: ADVANCED CROSS-ENCODER RE-RANKING ───────────────────────────────
+// Medical-focused cross-encoder with comprehensive term weighting and semantic analysis
 
 function crossEncoderScore(query, chunkContent) {
+  const queryLower = query.toLowerCase();
+  const contentLower = chunkContent.toLowerCase();
+  
+  // Extract query terms with medical preprocessing
   const queryTerms = new Set(
-    query.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(t => t.length > 2)
+    queryLower.replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length > 2)
+      .flatMap(term => {
+        // Medical term expansion for better matching
+        const expansions = {
+          'fever': ['fever', 'pyrexia', 'temperature', 'febrile'],
+          'pain': ['pain', 'ache', 'discomfort', 'hurt', 'sore'],
+          'headache': ['headache', 'cephalgia', 'migraine'],
+          'stomach': ['stomach', 'abdominal', 'gastric', 'belly'],
+          'heart': ['heart', 'cardiac', 'cardiovascular'],
+          'breathing': ['breathing', 'respiratory', 'dyspnea'],
+          'diabetes': ['diabetes', 'diabetic', 'glucose', 'insulin'],
+          'infection': ['infection', 'bacterial', 'viral', 'pathogen']
+        };
+        return expansions[term] || [term];
+      })
   );
-  const chunkTerms = chunkContent.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
+  
+  const contentTerms = contentLower.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
 
-  let matches = 0;
-  let weightedMatches = 0;
+  // Advanced term matching with medical weighting
+  let exactMatches = 0;
+  let partialMatches = 0;
+  let weightedScore = 0;
+  let semanticBonus = 0;
 
-  // Medical terms get higher weight
-  const medicalBoost = new Set(['symptom','disease','treatment','diagnosis','medication','precaution','cause','prevention','therapy','syndrome','disorder','condition','infection','chronic','acute']);
+  // Critical medical terms (highest priority)
+  const criticalTerms = new Set([
+    'emergency', 'critical', 'severe', 'acute', 'urgent', 'immediate',
+    'heart attack', 'stroke', 'anaphylaxis', 'sepsis', 'shock', 'coma'
+  ]);
 
-  for (const term of chunkTerms) {
-    if (queryTerms.has(term)) {
-      matches++;
-      weightedMatches += medicalBoost.has(term) ? 2 : 1;
+  // High-priority medical terms
+  const medicalTerms = new Set([
+    'symptom', 'disease', 'treatment', 'diagnosis', 'medication', 'therapy',
+    'syndrome', 'disorder', 'condition', 'infection', 'chronic', 'fever',
+    'headache', 'nausea', 'vomiting', 'diarrhea', 'fatigue', 'weakness',
+    'diabetes', 'hypertension', 'malaria', 'dengue', 'typhoid', 'pneumonia'
+  ]);
+
+  // Anatomical terms
+  const anatomicalTerms = new Set([
+    'head', 'brain', 'heart', 'lung', 'liver', 'kidney', 'stomach',
+    'chest', 'abdomen', 'back', 'spine', 'joint', 'muscle', 'bone'
+  ]);
+
+  for (const contentTerm of contentTerms) {
+    if (queryTerms.has(contentTerm)) {
+      exactMatches++;
+      
+      // Apply medical term weighting
+      if (criticalTerms.has(contentTerm)) {
+        weightedScore += 5.0; // Critical medical terms
+      } else if (medicalTerms.has(contentTerm)) {
+        weightedScore += 3.0; // Important medical terms
+      } else if (anatomicalTerms.has(contentTerm)) {
+        weightedScore += 2.0; // Anatomical terms
+      } else {
+        weightedScore += 1.0; // Regular terms
+      }
+    } else {
+      // Check for partial matches (medical synonyms)
+      for (const queryTerm of queryTerms) {
+        if (contentTerm.includes(queryTerm) || queryTerm.includes(contentTerm)) {
+          partialMatches++;
+          weightedScore += 0.5;
+          break;
+        }
+      }
     }
   }
 
-  const coverage = queryTerms.size > 0 ? matches / queryTerms.size : 0;
-  const density  = chunkTerms.length > 0 ? weightedMatches / chunkTerms.length : 0;
+  // Semantic analysis bonuses
+  const queryWords = Array.from(queryTerms);
+  
+  // Medical context bonus
+  if (queryWords.some(w => medicalTerms.has(w)) && 
+      contentTerms.some(w => medicalTerms.has(w))) {
+    semanticBonus += 0.2;
+  }
+  
+  // Symptom-disease correlation bonus
+  const symptomWords = queryWords.filter(w => 
+    ['fever', 'headache', 'pain', 'nausea', 'fatigue', 'cough', 'rash'].includes(w)
+  );
+  const diseaseWords = contentTerms.filter(w => 
+    ['diabetes', 'malaria', 'dengue', 'typhoid', 'hypertension'].includes(w)
+  );
+  if (symptomWords.length > 0 && diseaseWords.length > 0) {
+    semanticBonus += 0.15;
+  }
 
-  return coverage * 0.7 + density * 0.3;
+  // Emergency context bonus
+  if (queryWords.some(w => criticalTerms.has(w)) && 
+      contentTerms.some(w => criticalTerms.has(w))) {
+    semanticBonus += 0.3;
+  }
+
+  // Calculate final scores
+  const coverage = queryTerms.size > 0 ? (exactMatches + partialMatches * 0.5) / queryTerms.size : 0;
+  const density = contentTerms.length > 0 ? weightedScore / contentTerms.length : 0;
+  const completeness = Math.min(1, exactMatches / Math.max(1, queryTerms.size));
+
+  // Enhanced scoring formula with medical focus
+  return Math.min(1, coverage * 0.4 + density * 0.3 + completeness * 0.2 + semanticBonus * 0.1);
 }
 
-function rerank(chunks, query, topK = 8) {
-  return chunks
+function rerank(chunks, query, topK = 12) { // Increased for better selection
+  const reranked = chunks
     .map(c => ({
       ...c,
       rerankScore: crossEncoderScore(query, c.content || ''),
     }))
     .sort((a, b) => {
-      // Blend: 60% vector similarity + 40% cross-encoder
-      const scoreA = (a.similarity || a.rrfScore || 0) * 0.6 + a.rerankScore * 0.4;
-      const scoreB = (b.similarity || b.rrfScore || 0) * 0.6 + b.rerankScore * 0.4;
+      // Advanced blending: vector similarity + RRF + cross-encoder
+      const vectorWeight = 0.35;
+      const rrfWeight = 0.25;
+      const rerankWeight = 0.4; // Increased cross-encoder influence
+      
+      const scoreA = (a.similarity || 0) * vectorWeight + 
+                     (a.rrfScore || 0) * rrfWeight + 
+                     a.rerankScore * rerankWeight;
+      const scoreB = (b.similarity || 0) * vectorWeight + 
+                     (b.rrfScore || 0) * rrfWeight + 
+                     b.rerankScore * rerankWeight;
+      
       return scoreB - scoreA;
-    })
-    .slice(0, topK);
+    });
+
+  return reranked.slice(0, topK);
 }
 
-// ─── STEP 6: MMR RE-RANKING ───────────────────────────────────────────────────
-// Maximal Marginal Relevance: balance relevance vs diversity
+// ─── STEP 6: ADVANCED MMR RE-RANKING ──────────────────────────────────────────
+// Enhanced Maximal Marginal Relevance with medical diversity and quality focus
 
-function mmrRerank(chunks, queryEmbedding, topK = 6, lambda = 0.65) {
+function mmrRerank(chunks, queryEmbedding, topK = 10, lambda = 0.75) { // Optimized parameters
   if (chunks.length <= topK) return chunks;
   if (!queryEmbedding) return chunks.slice(0, topK);
 
-  const selected  = [];
+  const selected = [];
   const remaining = [...chunks];
+
+  // Pre-calculate embeddings for efficiency
+  const chunkEmbeddings = remaining.map(c => {
+    const emb = typeof c.embedding === 'string' ? JSON.parse(c.embedding) : (c.embedding || []);
+    return { chunk: c, embedding: emb };
+  });
 
   while (selected.length < topK && remaining.length > 0) {
     let bestScore = -Infinity;
-    let bestIdx   = 0;
+    let bestIdx = 0;
 
     for (let i = 0; i < remaining.length; i++) {
-      const c    = remaining[i];
-      const cEmb = typeof c.embedding === 'string' ? JSON.parse(c.embedding) : (c.embedding || []);
+      const current = chunkEmbeddings[i];
+      if (!current) continue;
+      
+      const chunk = current.chunk;
+      const cEmb = current.embedding;
 
-      const relevance = c.similarity ?? cosineSim(queryEmbedding, cEmb);
+      // Base relevance score (combination of all previous scores)
+      const vectorSim = chunk.similarity || 0;
+      const rrfScore = chunk.rrfScore || 0;
+      const rerankScore = chunk.rerankScore || 0;
+      
+      // Weighted relevance combining all signals
+      const relevance = vectorSim * 0.4 + rrfScore * 0.3 + rerankScore * 0.3;
 
+      // Calculate maximum redundancy with selected chunks
       let maxRedundancy = 0;
       for (const sel of selected) {
         const sEmb = typeof sel.embedding === 'string' ? JSON.parse(sel.embedding) : (sel.embedding || []);
-        const sim  = cosineSim(cEmb, sEmb);
+        const sim = cosineSim(cEmb, sEmb);
         if (sim > maxRedundancy) maxRedundancy = sim;
       }
 
-      const score = lambda * relevance - (1 - lambda) * maxRedundancy;
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
+      // Enhanced diversity bonuses
+      let diversityBonus = 0;
+      
+      // Category diversity bonus
+      const selectedCategories = new Set(selected.map(s => s.category));
+      if (!selectedCategories.has(chunk.category)) {
+        diversityBonus += 0.15; // Bonus for new category
+      }
+      
+      // Source diversity bonus
+      const selectedSources = new Set(selected.map(s => s.source));
+      if (!selectedSources.has(chunk.source)) {
+        diversityBonus += 0.1; // Bonus for new source
+      }
+      
+      // Medical priority bonus
+      let medicalBonus = 0;
+      if (chunk.category === 'emergency') medicalBonus += 0.2;
+      else if (chunk.category === 'disease') medicalBonus += 0.15;
+      else if (chunk.category === 'qa') medicalBonus += 0.1;
+      
+      // Quality bonus based on similarity scores
+      const qualityBonus = Math.min(0.1, (vectorSim + rerankScore) * 0.05);
+
+      // Enhanced MMR formula
+      const mmrScore = lambda * relevance - 
+                      (1 - lambda) * maxRedundancy + 
+                      diversityBonus + 
+                      medicalBonus + 
+                      qualityBonus;
+
+      if (mmrScore > bestScore) {
+        bestScore = mmrScore;
+        bestIdx = i;
+      }
     }
 
-    selected.push(remaining[bestIdx]);
+    // Move best chunk from remaining to selected
+    const bestChunk = remaining[bestIdx];
+    selected.push(bestChunk);
     remaining.splice(bestIdx, 1);
+    chunkEmbeddings.splice(bestIdx, 1);
   }
 
   return selected;
 }
 
-// ─── STEP 7: BUILD CONTEXT (token-aware) ─────────────────────────────────────
+// ─── STEP 7: ENHANCED CONTEXT BUILDING (token-aware) ─────────────────────────
 
-const MAX_CONTEXT_CHARS = 6000; // ~1500 tokens — safe for 70b model's 32k context
+const MAX_CONTEXT_CHARS = 10000; // Increased for more comprehensive context
 
 function buildContext(chunks) {
-  // Deduplicate by doc_id — keep highest similarity chunk per document
+  // Advanced deduplication with medical priority and quality scoring
   const seen = new Map();
+  
   for (const chunk of chunks) {
     const key = chunk.doc_id || chunk.title;
-    if (!seen.has(key) || (chunk.similarity ?? 0) > (seen.get(key).similarity ?? 0)) {
-      seen.set(key, chunk);
+    const existing = seen.get(key);
+    
+    // Comprehensive priority calculation
+    const vectorScore = chunk.similarity || 0;
+    const rrfScore = chunk.rrfScore || 0;
+    const rerankScore = chunk.rerankScore || 0;
+    
+    // Category priority weights
+    const categoryWeight = {
+      'emergency': 0.3,
+      'disease': 0.2,
+      'qa': 0.15,
+      'treatment': 0.1,
+      'prevention': 0.05
+    }[chunk.category] || 0;
+    
+    // Source reliability weights
+    const sourceWeight = {
+      'MedQuAD': 0.15,
+      'DSP': 0.1,
+      'BuiltinKnowledge': 0.05
+    }[chunk.source] || 0;
+    
+    const priority = vectorScore * 0.4 + 
+                    rrfScore * 0.3 + 
+                    rerankScore * 0.2 + 
+                    categoryWeight + 
+                    sourceWeight;
+    
+    if (!existing || priority > (existing.priority || 0)) {
+      seen.set(key, { ...chunk, priority });
     }
   }
 
-  const deduped = [...seen.values()];
-  const parts   = [];
+  const deduped = [...seen.values()].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  const parts = [];
   let totalChars = 0;
 
   for (let i = 0; i < deduped.length; i++) {
-    const c       = deduped[i];
-    const simPct  = c.similarity !== undefined ? ` (${(c.similarity * 100).toFixed(0)}% match)` : '';
-    const source  = c.source ? ` | Source: ${c.source}` : '';
-    const header  = `[${i + 1}] ${c.title}${simPct}${source}`;
-    const budget  = MAX_CONTEXT_CHARS - totalChars - header.length - 10;
-    if (budget < 100) break;
-    const body  = c.content.slice(0, budget);
-    const entry = `${header}\n${body}`;
+    const c = deduped[i];
+    
+    // Enhanced metadata display
+    const simPct = c.similarity !== undefined ? ` (${(c.similarity * 100).toFixed(0)}% match)` : '';
+    const rrfInfo = c.rrfScore ? ` RRF:${c.rrfScore.toFixed(3)}` : '';
+    const rerankInfo = c.rerankScore ? ` Rerank:${(c.rerankScore * 100).toFixed(0)}%` : '';
+    const source = c.source ? ` | Source: ${c.source}` : '';
+    const category = c.category ? ` | Category: ${c.category}` : '';
+    
+    const header = `[${i + 1}] ${c.title}${simPct}${rrfInfo}${rerankInfo}${source}${category}`;
+    const budget = MAX_CONTEXT_CHARS - totalChars - header.length - 20; // Extra buffer
+    
+    if (budget < 200) break; // Increased minimum for better content
+    
+    // Smart content truncation - try to preserve complete sentences
+    let content = c.content;
+    if (content.length > budget) {
+      content = content.slice(0, budget);
+      const lastSentence = content.lastIndexOf('.');
+      if (lastSentence > budget * 0.7) { // If we can preserve 70% and get complete sentence
+        content = content.slice(0, lastSentence + 1);
+      } else {
+        content += '...';
+      }
+    }
+    
+    const entry = `${header}\n${content}`;
     parts.push(entry);
     totalChars += entry.length;
   }
@@ -392,38 +761,46 @@ function buildContext(chunks) {
 async function generateWithGroq(userQuery, chunks, history = []) {
   const context = buildContext(chunks);
 
-  const systemPrompt = `You are MedAssist AI, a highly knowledgeable and empathetic medical health assistant powered by a RAG (Retrieval-Augmented Generation) system.
+  const systemPrompt = `You are MedAssist AI, a highly knowledgeable and empathetic medical health assistant powered by an advanced RAG (Retrieval-Augmented Generation) system with comprehensive medical knowledge.
 
-INSTRUCTIONS:
-1. THINK STEP BY STEP before answering. Internally reason about the symptoms, possible conditions, and relevant information from the context.
-2. Use ONLY the information in the provided medical knowledge context. Do NOT hallucinate or invent facts.
-3. Structure your response clearly using markdown:
-   - Start with a brief summary of what the user is experiencing
-   - List possible conditions or explanations
-   - Provide actionable advice and precautions
-   - Mention when to seek immediate medical attention
-4. Be specific and detailed — the user deserves a thorough, helpful answer.
-5. If the context is insufficient, say so honestly and suggest consulting a doctor.
-6. ALWAYS end with: "⚠️ This information is for educational purposes only. Please consult a qualified healthcare professional for proper diagnosis and treatment."
+CRITICAL INSTRUCTIONS:
+1. MEDICAL ACCURACY: Use ONLY the information in the provided medical knowledge context. Never hallucinate medical facts.
+2. COMPREHENSIVE ANALYSIS: Think step-by-step through symptoms, possible conditions, and relevant treatments from the context.
+3. STRUCTURED RESPONSE: Use clear markdown formatting:
+   - **Brief Summary**: What the user is experiencing
+   - **Possible Conditions**: List potential diagnoses with explanations
+   - **Recommended Actions**: Specific, actionable medical advice
+   - **When to Seek Care**: Clear guidance on urgency levels
+   - **Precautions**: Important safety measures
+4. MEDICAL TERMINOLOGY: Use appropriate medical terms but explain them clearly
+5. EVIDENCE-BASED: Reference the medical knowledge provided and explain reasoning
+6. SAFETY FIRST: Always err on the side of caution for medical advice
 
-TONE: Warm, clear, professional. Avoid jargon unless explained.`;
+RESPONSE QUALITY STANDARDS:
+- Be thorough and detailed - medical information deserves comprehensive answers
+- Include specific symptoms, treatments, and precautions from the context
+- Provide clear next steps and when to seek professional care
+- Use empathetic, professional tone appropriate for healthcare
+- Always end with the medical disclaimer
 
-  // Include last 6 turns of conversation history for better context continuity
-  const historyMessages = history.slice(-6).map(h => ({
+MANDATORY DISCLAIMER: "⚠️ This information is for educational purposes only. Please consult a qualified healthcare professional for proper diagnosis and treatment."`;
+
+  // Enhanced history context with medical focus
+  const historyMessages = history.slice(-4).map(h => ({
     role: h.role,
-    content: h.content.slice(0, 500),
+    content: h.content.slice(0, 400), // Slightly reduced for more context space
   }));
 
-  const userPrompt = `## Retrieved Medical Knowledge (via hybrid vector + keyword search)
+  const userPrompt = `## Medical Knowledge Context (Retrieved via Advanced RAG Pipeline)
 
 ${context}
 
 ---
 
-## User Question
+## Patient Query
 "${userQuery}"
 
-Based on the retrieved medical knowledge above, provide a comprehensive, structured, and helpful response. Think through the symptoms and conditions carefully before answering.`;
+Based on the comprehensive medical knowledge above, provide a thorough, structured, and medically accurate response. Analyze the symptoms carefully, consider all relevant conditions from the context, and provide detailed guidance while maintaining the highest medical standards.`;
 
   const chat = await groq.chat.completions.create({
     model: GROQ_MODEL,
@@ -432,9 +809,9 @@ Based on the retrieved medical knowledge above, provide a comprehensive, structu
       ...historyMessages,
       { role: 'user', content: userPrompt },
     ],
-    temperature: 0.2,   // lower = more factual, less creative
-    max_tokens: 1200,   // more room for detailed answers
-    top_p: 0.9,
+    temperature: 0.1,   // Lower temperature for more consistent medical responses
+    max_tokens: 1500,   // Increased for more comprehensive responses
+    top_p: 0.85,        // Slightly more focused
   });
 
   return chat.choices[0]?.message?.content?.trim() || null;
@@ -493,20 +870,20 @@ export async function ragQuery(userMessage, history = []) {
   // ── STEP 1+2: Rewrite + Embed query ──
   const queryEmbedding = await embedQuery(userMessage);
 
-  // ── STEP 3: Hybrid retrieval (vector + keyword in parallel) ──
+  // ── STEP 3: Enhanced hybrid retrieval (vector + keyword in parallel) ──
   const [vectorChunks, keywordChunks] = await Promise.all([
-    vectorRetrieve(queryEmbedding, 15),
-    keywordRetrieve(userMessage, 15),
+    vectorRetrieve(queryEmbedding, 25), // Increased for better recall
+    keywordRetrieve(userMessage, 25),   // Increased for better recall
   ]);
 
-  // ── STEP 4: Reciprocal Rank Fusion ──
+  // ── STEP 4: Enhanced Reciprocal Rank Fusion ──
   const fusedChunks = reciprocalRankFusion([vectorChunks, keywordChunks]);
 
-  // ── STEP 5: Cross-encoder re-ranking ──
-  const reranked = rerank(fusedChunks, userMessage, 12);
+  // ── STEP 5: Advanced cross-encoder re-ranking ──
+  const reranked = rerank(fusedChunks, userMessage, 18); // Increased for better selection
 
-  // ── STEP 6: MMR for diversity ──
-  const finalChunks = mmrRerank(reranked, queryEmbedding, 6, 0.65);
+  // ── STEP 6: Advanced MMR for diversity and quality ──
+  const finalChunks = mmrRerank(reranked, queryEmbedding, 10, 0.75); // Optimized parameters
 
   if (!finalChunks || finalChunks.length === 0) {
     return {
