@@ -14,6 +14,7 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { ragQuery } from './rag.js';
 import { warmupEmbedder } from './embed.js';
+import { evaluateModel, getModelMetrics } from './model-evaluation.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -104,6 +105,50 @@ app.post('/api/chat', async (req, res) => {
         timestamp: new Date().toISOString(),
         error: true
       }
+    });
+  }
+});
+
+// ─── MODEL EVALUATION ────────────────────────────────────────────────────────
+
+app.get('/api/model/metrics', async (_req, res) => {
+  try {
+    const metrics = await getModelMetrics();
+    res.json({
+      status: 'success',
+      metrics,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[Model Metrics] Error:', err.message);
+    res.status(500).json({ error: 'Failed to get model metrics' });
+  }
+});
+
+app.post('/api/model/evaluate', async (_req, res) => {
+  console.log('\n🧠 ===== MODEL EVALUATION REQUEST =====');
+  console.log(`⏰ Started at: ${new Date().toISOString()}`);
+  
+  try {
+    const evaluation = await evaluateModel();
+    
+    console.log('📊 ===== EVALUATION COMPLETE =====');
+    console.log(`🎯 Overall Score: ${(evaluation.overall_score * 100).toFixed(1)}%`);
+    console.log(`🔍 Retrieval: ${(evaluation.retrieval_metrics.average_score * 100).toFixed(1)}%`);
+    console.log(`🤖 Generation: ${(evaluation.generation_metrics.average_score * 100).toFixed(1)}%`);
+    console.log(`⚡ Efficiency: ${(evaluation.efficiency_metrics.average_score * 100).toFixed(1)}%`);
+    console.log('=====================================\n');
+    
+    res.json({
+      status: 'success',
+      evaluation,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[Model Evaluation] Error:', err.message);
+    res.status(500).json({ 
+      error: 'Model evaluation failed',
+      message: err.message 
     });
   }
 });
