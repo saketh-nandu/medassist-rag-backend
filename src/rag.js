@@ -517,41 +517,71 @@ export async function ragQuery(userMessage, history = []) {
     };
   }
 
-  // ── DETAILED RAG SCORING AND LOGGING ──
+  // ── DETAILED RAG SCORING AND LOGGING WITH DATASET SOURCES ──
   console.log('\n🧠 ===== RAG PIPELINE DETAILED RESULTS =====');
   console.log(`📊 Pipeline Stats: ${vectorChunks.length} vector + ${keywordChunks.length} keyword → ${fusedChunks.length} fused → ${reranked.length} reranked → ${finalChunks.length} final`);
   
-  // Log top vector results with scores
+  // Function to get detailed dataset source information
+  function getDatasetSource(chunk) {
+    const metadata = chunk.metadata ? (typeof chunk.metadata === 'string' ? JSON.parse(chunk.metadata) : chunk.metadata) : {};
+    let datasetInfo = '';
+    
+    if (chunk.source === 'MedQuAD') {
+      const folder = metadata.folder || 'Unknown';
+      const filename = metadata.filename || chunk.doc_id || 'Unknown';
+      datasetInfo = `📁 MedQuAD/${folder}/${filename}`;
+    } else if (chunk.source === 'DSP') {
+      const csvFile = metadata.csv_file || metadata.source_file || 'dataset.csv';
+      const rowIndex = metadata.row_index || metadata.index || 'Unknown';
+      datasetInfo = `📊 DSP/${csvFile} (Row ${rowIndex})`;
+    } else if (chunk.source === 'BuiltinKnowledge') {
+      const knowledgeType = metadata.type || 'medical_knowledge';
+      datasetInfo = `🏥 BuiltinKnowledge/${knowledgeType}`;
+    } else {
+      datasetInfo = `📄 ${chunk.source || 'Unknown'}`;
+    }
+    
+    return datasetInfo;
+  }
+  
+  // Log top vector results with detailed dataset sources
   console.log('\n🔍 TOP VECTOR SEARCH RESULTS:');
   vectorChunks.slice(0, 3).forEach((chunk, i) => {
-    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 60)}...`);
-    console.log(`     Source: ${chunk.source} | Category: ${chunk.category}`);
+    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 50)}...`);
+    console.log(`     📚 Source: ${chunk.source} | Category: ${chunk.category}`);
+    console.log(`     ${getDatasetSource(chunk)}`);
+    if (chunk.chunk_index !== undefined) console.log(`     📑 Chunk: ${chunk.chunk_index + 1} | Doc ID: ${chunk.doc_id}`);
   });
   
-  // Log top keyword results
+  // Log top keyword results with detailed dataset sources
   console.log('\n🔤 TOP KEYWORD SEARCH RESULTS:');
   keywordChunks.slice(0, 3).forEach((chunk, i) => {
-    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 60)}...`);
-    console.log(`     Source: ${chunk.source} | Category: ${chunk.category}`);
+    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 50)}...`);
+    console.log(`     📚 Source: ${chunk.source} | Category: ${chunk.category}`);
+    console.log(`     ${getDatasetSource(chunk)}`);
+    if (chunk.chunk_index !== undefined) console.log(`     📑 Chunk: ${chunk.chunk_index + 1} | Doc ID: ${chunk.doc_id}`);
   });
   
-  // Log RRF scores
+  // Log RRF scores with dataset sources
   console.log('\n🔄 RECIPROCAL RANK FUSION SCORES:');
   fusedChunks.slice(0, 3).forEach((chunk, i) => {
-    console.log(`  ${i + 1}. [RRF: ${chunk.rrfScore?.toFixed(4)}] ${chunk.title?.slice(0, 60)}...`);
+    console.log(`  ${i + 1}. [RRF: ${chunk.rrfScore?.toFixed(4)}] ${chunk.title?.slice(0, 50)}...`);
+    console.log(`     ${getDatasetSource(chunk)}`);
   });
   
-  // Log final re-ranked results with all scores
-  console.log('\n🎯 FINAL RE-RANKED RESULTS:');
+  // Log final re-ranked results with all scores and detailed dataset sources
+  console.log('\n🎯 FINAL RE-RANKED RESULTS WITH DATASET SOURCES:');
   finalChunks.forEach((chunk, i) => {
     const vectorSim = chunk.similarity ? (chunk.similarity * 100).toFixed(1) : 'N/A';
     const rrfScore = chunk.rrfScore ? chunk.rrfScore.toFixed(4) : 'N/A';
     const rerankScore = chunk.rerankScore ? (chunk.rerankScore * 100).toFixed(1) : 'N/A';
     
-    console.log(`  ${i + 1}. "${chunk.title?.slice(0, 50)}..."`);
-    console.log(`     📈 Vector: ${vectorSim}% | RRF: ${rrfScore} | Rerank: ${rerankScore}%`);
+    console.log(`  ${i + 1}. "${chunk.title?.slice(0, 45)}..."`);
+    console.log(`     📈 Scores: Vector ${vectorSim}% | RRF ${rrfScore} | Rerank ${rerankScore}%`);
     console.log(`     📚 Source: ${chunk.source} | Category: ${chunk.category}`);
-    console.log(`     📄 Content: ${chunk.content?.slice(0, 100)}...`);
+    console.log(`     ${getDatasetSource(chunk)}`);
+    if (chunk.chunk_index !== undefined) console.log(`     📑 Chunk ${chunk.chunk_index + 1} of document "${chunk.doc_id}"`);
+    console.log(`     📄 Content: ${chunk.content?.slice(0, 80)}...`);
     console.log('');
   });
   
@@ -614,14 +644,38 @@ export async function ragQuery(userMessage, history = []) {
         rerankedResults: reranked.length,
         finalResults: finalChunks.length
       },
-      topSources: finalChunks.map(chunk => ({
-        title: chunk.title,
-        source: chunk.source,
-        category: chunk.category,
-        vectorScore: chunk.similarity ? (chunk.similarity * 100).toFixed(1) : null,
-        rrfScore: chunk.rrfScore ? chunk.rrfScore.toFixed(4) : null,
-        rerankScore: chunk.rerankScore ? (chunk.rerankScore * 100).toFixed(1) : null
-      })),
+      topSources: finalChunks.map(chunk => {
+        const metadata = chunk.metadata ? (typeof chunk.metadata === 'string' ? JSON.parse(chunk.metadata) : chunk.metadata) : {};
+        let datasetPath = '';
+        
+        if (chunk.source === 'MedQuAD') {
+          const folder = metadata.folder || 'Unknown';
+          const filename = metadata.filename || chunk.doc_id || 'Unknown';
+          datasetPath = `MedQuAD/${folder}/${filename}`;
+        } else if (chunk.source === 'DSP') {
+          const csvFile = metadata.csv_file || metadata.source_file || 'dataset.csv';
+          const rowIndex = metadata.row_index || metadata.index || 'Unknown';
+          datasetPath = `DSP/${csvFile} (Row ${rowIndex})`;
+        } else if (chunk.source === 'BuiltinKnowledge') {
+          const knowledgeType = metadata.type || 'medical_knowledge';
+          datasetPath = `BuiltinKnowledge/${knowledgeType}`;
+        } else {
+          datasetPath = chunk.source || 'Unknown';
+        }
+        
+        return {
+          title: chunk.title,
+          source: chunk.source,
+          category: chunk.category,
+          datasetPath: datasetPath,
+          chunkIndex: chunk.chunk_index,
+          docId: chunk.doc_id,
+          vectorScore: chunk.similarity ? (chunk.similarity * 100).toFixed(1) : null,
+          rrfScore: chunk.rrfScore ? chunk.rrfScore.toFixed(4) : null,
+          rerankScore: chunk.rerankScore ? (chunk.rerankScore * 100).toFixed(1) : null,
+          metadata: metadata
+        };
+      }),
       generationStats,
       queryExpansion: rewriteQuery(userMessage) !== userMessage ? rewriteQuery(userMessage) : null
     }
