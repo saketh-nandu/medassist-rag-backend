@@ -756,7 +756,7 @@ function buildContext(chunks) {
   return parts.join('\n\n---\n\n');
 }
 
-// ─── STEP 8: LLM GENERATION ──────────────────────────────────────────────────
+// ─── STEP 8: ENHANCED LLM GENERATION WITH FALLBACK ──────────────────────────
 
 async function generateWithGroq(userQuery, chunks, history = []) {
   const context = buildContext(chunks);
@@ -802,19 +802,87 @@ ${context}
 
 Based on the comprehensive medical knowledge above, provide a thorough, structured, and medically accurate response. Analyze the symptoms carefully, consider all relevant conditions from the context, and provide detailed guidance while maintaining the highest medical standards.`;
 
-  const chat = await groq.chat.completions.create({
-    model: GROQ_MODEL,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...historyMessages,
-      { role: 'user', content: userPrompt },
-    ],
-    temperature: 0.1,   // Lower temperature for more consistent medical responses
-    max_tokens: 1500,   // Increased for more comprehensive responses
-    top_p: 0.85,        // Slightly more focused
-  });
+  try {
+    const chat = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...historyMessages,
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.1,   // Lower temperature for more consistent medical responses
+      max_tokens: 1500,   // Increased for more comprehensive responses
+      top_p: 0.85,        // Slightly more focused
+    });
 
-  return chat.choices[0]?.message?.content?.trim() || null;
+    return chat.choices[0]?.message?.content?.trim() || null;
+  } catch (error) {
+    console.warn('[Groq] Generation failed, using enhanced fallback:', error.message);
+    
+    // Enhanced fallback generation using medical context
+    return generateMedicalFallback(userQuery, chunks);
+  }
+}
+
+// Enhanced fallback generation for when Groq fails
+function generateMedicalFallback(userQuery, chunks) {
+  if (!chunks || chunks.length === 0) {
+    return `I apologize, but I couldn't find specific medical information for your query: "${userQuery}". Please consult a qualified healthcare professional for proper evaluation and guidance.
+
+⚠️ This information is for educational purposes only. Please consult a qualified healthcare professional for proper diagnosis and treatment.`;
+  }
+
+  // Extract key medical information from top chunks
+  const topChunks = chunks.slice(0, 3);
+  const conditions = [...new Set(topChunks.map(c => c.title))];
+  const categories = [...new Set(topChunks.map(c => c.category))];
+  
+  // Build comprehensive medical response
+  let response = `## Medical Information for: "${userQuery}"\n\n`;
+  
+  // Add brief summary
+  response += `**Brief Summary**: Based on your query, this may be related to ${conditions.slice(0, 2).join(' or ')}.\n\n`;
+  
+  // Add possible conditions
+  response += `**Possible Conditions**:\n`;
+  topChunks.forEach((chunk, i) => {
+    const content = chunk.content || '';
+    
+    // Extract symptoms if available
+    const symptomsMatch = content.match(/symptoms?:?\s*([^.]+)/i);
+    const symptoms = symptomsMatch ? symptomsMatch[1].slice(0, 100) : 'Various symptoms may be present';
+    
+    // Extract treatment if available
+    const treatmentMatch = content.match(/treatment:?\s*([^.]+)/i);
+    const treatment = treatmentMatch ? treatmentMatch[1].slice(0, 100) : 'Consult healthcare provider for treatment';
+    
+    response += `${i + 1}. **${chunk.title}**: ${symptoms}. Treatment: ${treatment}.\n`;
+  });
+  
+  response += `\n**Recommended Actions**:\n`;
+  response += `- Monitor your symptoms carefully\n`;
+  response += `- Keep a record of when symptoms started and their severity\n`;
+  response += `- Stay hydrated and get adequate rest\n`;
+  response += `- Avoid self-medication without professional guidance\n`;
+  
+  response += `\n**When to Seek Care**:\n`;
+  if (categories.includes('emergency')) {
+    response += `- **Seek immediate medical attention** - this may be an emergency condition\n`;
+    response += `- Call emergency services (108) if symptoms are severe\n`;
+  } else {
+    response += `- Consult a healthcare provider if symptoms persist or worsen\n`;
+    response += `- Seek immediate care if you develop severe symptoms\n`;
+  }
+  
+  response += `\n**Precautions**:\n`;
+  response += `- Follow proper hygiene practices\n`;
+  response += `- Avoid contact with others if you have infectious symptoms\n`;
+  response += `- Take prescribed medications as directed\n`;
+  response += `- Don't ignore persistent or worsening symptoms\n`;
+  
+  response += `\n⚠️ This information is for educational purposes only. Please consult a qualified healthcare professional for proper diagnosis and treatment.`;
+  
+  return response;
 }
 
 // ─── EXTRACT STRUCTURED METADATA FROM CHUNKS ─────────────────────────────────
@@ -998,8 +1066,8 @@ export async function ragQuery(userMessage, history = []) {
 
   // Fallback if Groq fails
   if (!content) {
-    const topChunk = finalChunks[0];
-    content = `Based on your symptoms, this may be related to **${topChunk.title}**.\n\n${topChunk.content.slice(0, 500)}...\n\n⚠️ *This is not a medical diagnosis. Please consult a qualified healthcare professional.*`;
+    console.log('[RAG] Using enhanced medical fallback response');
+    content = generateMedicalFallback(userMessage, finalChunks);
   }
 
   const { conditions, suggestedActions } = extractMetadata(finalChunks);
