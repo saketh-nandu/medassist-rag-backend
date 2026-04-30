@@ -1,11 +1,14 @@
 /**
- * rag.js — ACTUAL Retrieval-Augmented Generation
+ * rag.js — Enhanced Retrieval-Augmented Generation
  *
  * Pipeline:
- *   1. EMBED   — encode user query → 384-dim vector (all-MiniLM-L6-v2)
- *   2. RETRIEVE — cosine similarity search in Supabase pgvector (medical_chunks)
- *   3. AUGMENT  — build context string from top-k chunks
- *   4. GENERATE — Groq LLM (llama-3.1-8b-instant) produces grounded answer
+ *   1. REWRITE   — expand + enrich query using symptom/medical ontology
+ *   2. EMBED     — encode rewritten query → 384-dim vector (all-MiniLM-L6-v2)
+ *   3. RETRIEVE  — hybrid: pgvector cosine + keyword BM25 scoring
+ *   4. FUSE      — Reciprocal Rank Fusion (RRF) to merge ranked lists
+ *   5. RERANK    — cross-encoder style scoring (query × chunk relevance)
+ *   6. MMR       — Maximal Marginal Relevance for diversity
+ *   7. GENERATE  — Groq llama-3.3-70b-versatile with chain-of-thought prompt
  */
 
 import { createClient } from '@supabase/supabase-js';
@@ -20,7 +23,9 @@ const supabase = createClient(
 );
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const GROQ_MODEL = 'llama-3.1-8b-instant';
+
+// Use the most capable free Groq model
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 // ─── GREETING / SMALL-TALK DETECTION ─────────────────────────────────────────
 
@@ -45,7 +50,7 @@ function greetingResponse(type) {
     severity: 'low', affectedAreas: [], isEmergency: false,
   };
   if (type === 'smalltalk') return {
-    content: `I'm MedAssist AI — your AI-powered health assistant! 🏥\n\nI use a medical knowledge base with vector search to find the most relevant information for your question, then generate a response using an LLM.\n\nJust describe what you're experiencing and I'll help. Always consult a doctor for proper diagnosis.`,
+    content: `I'm MedAssist AI — your AI-powered health assistant! 🏥\n\nI use a medical knowledge base with hybrid vector + keyword search to find the most relevant information for your question, then generate a response using a large language model.\n\nJust describe what you're experiencing and I'll help. Always consult a doctor for proper diagnosis.`,
     conditions: [], suggestedActions: ['Tell me your symptoms','Ask about a health condition'],
     severity: 'low', affectedAreas: [], isEmergency: false,
   };
@@ -100,43 +105,55 @@ function calcSeverity(text) {
 }
 
 // ─── STEP 1: QUERY REWRITING ─────────────────────────────────────────────────
-// Expand the raw user query into a richer search query for better retrieval
+// Expands the raw query with medical synonyms and related terms for better recall
+
+const SYMPTOM_EXPANSION = {
+  'headache':      'headache migraine tension cephalgia head pain intracranial pressure',
+  'fever':         'fever pyrexia high temperature febrile hyperthermia chills',
+  'cough':         'cough respiratory bronchitis cold productive dry cough mucus',
+  'stomach':       'stomach abdominal pain gastric nausea gastritis peptic ulcer',
+  'chest':         'chest pain cardiac heart angina respiratory pleurisy',
+  'back':          'back pain spine lumbar musculoskeletal herniated disc sciatica',
+  'rash':          'rash skin dermatitis eczema urticaria hives allergy eruption',
+  'fatigue':       'fatigue tiredness weakness exhaustion lethargy chronic fatigue',
+  'dizziness':     'dizziness vertigo balance vestibular lightheadedness syncope',
+  'breathing':     'breathing respiratory shortness of breath dyspnea wheezing apnea',
+  'joint':         'joint pain arthritis rheumatoid gout inflammation swelling',
+  'throat':        'throat sore pharyngitis tonsillitis strep laryngitis',
+  'diabetes':      'diabetes mellitus blood sugar insulin glucose hyperglycemia',
+  'blood pressure':'hypertension hypotension blood pressure cardiovascular',
+  'anxiety':       'anxiety panic disorder stress mental health nervousness',
+  'depression':    'depression mood disorder mental health sadness hopelessness',
+  'allergy':       'allergy allergic reaction hypersensitivity anaphylaxis',
+  'infection':     'infection bacterial viral fungal pathogen sepsis',
+  'pain':          'pain ache discomfort soreness tenderness inflammation',
+  'swelling':      'swelling edema inflammation fluid retention bloating',
+  'nausea':        'nausea vomiting emesis queasiness motion sickness',
+  'diarrhea':      'diarrhea loose stool gastroenteritis bowel irritable',
+  'insomnia':      'insomnia sleep disorder sleeplessness restless sleep apnea',
+  'weight':        'weight loss gain obesity BMI metabolism thyroid',
+};
 
 function rewriteQuery(userQuery) {
   const lower = userQuery.toLowerCase();
-  const expansions = [];
+  const expansions = new Set();
 
-  // Symptom → disease expansion
-  const symptomMap = {
-    'headache': 'headache migraine tension head pain',
-    'fever': 'fever temperature pyrexia high temperature',
-    'cough': 'cough respiratory bronchitis cold',
-    'stomach': 'stomach abdominal pain gastric nausea',
-    'chest': 'chest pain cardiac heart respiratory',
-    'back': 'back pain spine lumbar musculoskeletal',
-    'rash': 'rash skin dermatitis allergy',
-    'fatigue': 'fatigue tiredness weakness exhaustion',
-    'dizziness': 'dizziness vertigo balance head',
-    'breathing': 'breathing respiratory shortness of breath dyspnea',
-  };
-
-  for (const [kw, expansion] of Object.entries(symptomMap)) {
-    if (lower.includes(kw)) expansions.push(expansion);
+  for (const [kw, expansion] of Object.entries(SYMPTOM_EXPANSION)) {
+    if (lower.includes(kw)) expansions.add(expansion);
   }
 
-  // If we found expansions, append them
-  if (expansions.length > 0) {
-    return `${userQuery} ${expansions.join(' ')}`;
+  if (expansions.size > 0) {
+    return `${userQuery} ${[...expansions].join(' ')}`;
   }
   return userQuery;
 }
 
-// ─── STEP 1: EMBED QUERY ─────────────────────────────────────────────────────
+// ─── STEP 2: EMBED QUERY ─────────────────────────────────────────────────────
 
 async function embedQuery(query) {
   try {
     const rewritten = rewriteQuery(query);
-    if (rewritten !== query) console.log(`[RAG] Query rewritten: "${rewritten.slice(0, 80)}..."`);
+    if (rewritten !== query) console.log(`[RAG] Query expanded: "${rewritten.slice(0, 100)}..."`);
     return await embedText(rewritten);
   } catch (err) {
     console.error('[RAG] Embedding failed:', err.message);
@@ -144,49 +161,75 @@ async function embedQuery(query) {
   }
 }
 
-// ─── STEP 2: VECTOR RETRIEVAL ─────────────────────────────────────────────────
+// ─── STEP 3a: VECTOR RETRIEVAL ────────────────────────────────────────────────
 
-async function retrieveChunks(queryEmbedding, topK = 8) {
+async function vectorRetrieve(queryEmbedding, topK = 15) {
   if (!queryEmbedding) return [];
 
-  // Primary: vector similarity search via pgvector
   const { data, error } = await supabase.rpc('match_chunks', {
-    query_embedding: queryEmbedding,  // pass as array — supabase-js handles serialization
+    query_embedding: queryEmbedding,
     match_count: topK,
   });
 
   if (!error && data && data.length > 0) {
-    console.log(`[RAG] Vector search: ${data.length} chunks, top similarity: ${data[0].similarity?.toFixed(3)}`);
+    console.log(`[RAG] Vector: ${data.length} chunks, top sim: ${data[0].similarity?.toFixed(3)}`);
     return data;
   }
 
   if (error) console.warn('[RAG] Vector search error:', error.message);
-
-  // Fallback: FTS if match_chunks function not yet created
-  console.warn('[RAG] Falling back to FTS — run SQL in setup-vector.sql to enable vector search');
   return await ftsFallback(queryEmbedding, topK);
 }
 
+// ─── STEP 3b: KEYWORD (BM25-style) RETRIEVAL ─────────────────────────────────
+// Uses Postgres full-text search as a second retrieval path
+
+async function keywordRetrieve(query, topK = 15) {
+  // Extract meaningful medical terms (skip stopwords)
+  const stopwords = new Set(['i','me','my','the','a','an','is','are','was','were','have','has','do','does','can','could','would','should','what','how','why','when','where','which','this','that','these','those','and','or','but','for','with','about','from','to','of','in','on','at','by','as','it','its','be','been','being','am','will','shall','may','might','must','need','used','get','got','feel','feeling','having','been','very','so','just','also','more','some','any','all','no','not','than','then','there','here','up','down','out','off','over','under','again','further','once']);
+
+  const terms = query.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length > 2 && !stopwords.has(t));
+
+  if (terms.length === 0) return [];
+
+  // Build tsquery: term1 | term2 | term3
+  const tsQuery = terms.slice(0, 8).join(' | ');
+
+  const { data, error } = await supabase
+    .from('medical_chunks')
+    .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
+    .textSearch('content', tsQuery, { type: 'websearch', config: 'english' })
+    .limit(topK);
+
+  if (error) {
+    console.warn('[RAG] Keyword search error:', error.message);
+    return [];
+  }
+
+  console.log(`[RAG] Keyword: ${(data || []).length} chunks`);
+  return (data || []).map((c, i) => ({ ...c, similarity: 1 - (i / topK) * 0.5 }));
+}
+
+// ─── STEP 3c: FTS FALLBACK ────────────────────────────────────────────────────
+
 async function ftsFallback(queryEmbedding, topK) {
-  // Try medical_chunks with manual cosine (slow but works without the function)
   const { data: chunks } = await supabase
     .from('medical_chunks')
     .select('id, doc_id, source, category, title, chunk_index, content, metadata, embedding')
     .limit(200);
 
   if (chunks && chunks.length > 0 && chunks[0].embedding) {
-    // Manual cosine similarity in JS
     const scored = chunks.map(c => {
       const emb = typeof c.embedding === 'string' ? JSON.parse(c.embedding) : c.embedding;
-      const sim = cosineSim(queryEmbedding, emb);
-      return { ...c, similarity: sim };
+      return { ...c, similarity: cosineSim(queryEmbedding, emb) };
     });
     scored.sort((a, b) => b.similarity - a.similarity);
-    console.log(`[RAG] JS cosine fallback: top similarity ${scored[0]?.similarity?.toFixed(3)}`);
+    console.log(`[RAG] JS cosine fallback: top sim ${scored[0]?.similarity?.toFixed(3)}`);
     return scored.slice(0, topK);
   }
 
-  // Last resort: FTS on old table
   const { data } = await supabase
     .from('medical_knowledge')
     .select('id, source, category, title, content, symptoms, precautions, metadata')
@@ -205,15 +248,81 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-10);
 }
 
-// ─── STEP 3: MMR RE-RANKING ──────────────────────────────────────────────────
-// Maximal Marginal Relevance: balance relevance vs diversity
-// Avoids returning 5 chunks all saying the same thing
+// ─── STEP 4: RECIPROCAL RANK FUSION (RRF) ────────────────────────────────────
+// Merges two ranked lists (vector + keyword) into one unified ranking.
+// RRF score = Σ 1 / (k + rank_i)  where k=60 is a smoothing constant.
 
-function mmrRerank(chunks, queryEmbedding, topK = 5, lambda = 0.6) {
+function reciprocalRankFusion(lists, k = 60) {
+  const scores = new Map(); // id → { score, chunk }
+
+  for (const list of lists) {
+    list.forEach((chunk, rank) => {
+      const id = String(chunk.id || chunk.doc_id);
+      const prev = scores.get(id) || { score: 0, chunk };
+      scores.set(id, {
+        score: prev.score + 1 / (k + rank + 1),
+        chunk: { ...prev.chunk, ...chunk }, // merge fields
+      });
+    });
+  }
+
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .map(({ score, chunk }) => ({ ...chunk, rrfScore: score }));
+}
+
+// ─── STEP 5: CROSS-ENCODER RE-RANKING ────────────────────────────────────────
+// Lightweight lexical cross-encoder: scores each chunk by term overlap with query.
+// A true neural cross-encoder would be ideal but this is fast and effective.
+
+function crossEncoderScore(query, chunkContent) {
+  const queryTerms = new Set(
+    query.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(t => t.length > 2)
+  );
+  const chunkTerms = chunkContent.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
+
+  let matches = 0;
+  let weightedMatches = 0;
+
+  // Medical terms get higher weight
+  const medicalBoost = new Set(['symptom','disease','treatment','diagnosis','medication','precaution','cause','prevention','therapy','syndrome','disorder','condition','infection','chronic','acute']);
+
+  for (const term of chunkTerms) {
+    if (queryTerms.has(term)) {
+      matches++;
+      weightedMatches += medicalBoost.has(term) ? 2 : 1;
+    }
+  }
+
+  const coverage = queryTerms.size > 0 ? matches / queryTerms.size : 0;
+  const density  = chunkTerms.length > 0 ? weightedMatches / chunkTerms.length : 0;
+
+  return coverage * 0.7 + density * 0.3;
+}
+
+function rerank(chunks, query, topK = 8) {
+  return chunks
+    .map(c => ({
+      ...c,
+      rerankScore: crossEncoderScore(query, c.content || ''),
+    }))
+    .sort((a, b) => {
+      // Blend: 60% vector similarity + 40% cross-encoder
+      const scoreA = (a.similarity || a.rrfScore || 0) * 0.6 + a.rerankScore * 0.4;
+      const scoreB = (b.similarity || b.rrfScore || 0) * 0.6 + b.rerankScore * 0.4;
+      return scoreB - scoreA;
+    })
+    .slice(0, topK);
+}
+
+// ─── STEP 6: MMR RE-RANKING ───────────────────────────────────────────────────
+// Maximal Marginal Relevance: balance relevance vs diversity
+
+function mmrRerank(chunks, queryEmbedding, topK = 6, lambda = 0.65) {
   if (chunks.length <= topK) return chunks;
   if (!queryEmbedding) return chunks.slice(0, topK);
 
-  const selected = [];
+  const selected  = [];
   const remaining = [...chunks];
 
   while (selected.length < topK && remaining.length > 0) {
@@ -221,21 +330,18 @@ function mmrRerank(chunks, queryEmbedding, topK = 5, lambda = 0.6) {
     let bestIdx   = 0;
 
     for (let i = 0; i < remaining.length; i++) {
-      const c = remaining[i];
+      const c    = remaining[i];
       const cEmb = typeof c.embedding === 'string' ? JSON.parse(c.embedding) : (c.embedding || []);
 
-      // Relevance to query
       const relevance = c.similarity ?? cosineSim(queryEmbedding, cEmb);
 
-      // Max similarity to already-selected chunks (redundancy penalty)
       let maxRedundancy = 0;
       for (const sel of selected) {
         const sEmb = typeof sel.embedding === 'string' ? JSON.parse(sel.embedding) : (sel.embedding || []);
-        const sim = cosineSim(cEmb, sEmb);
+        const sim  = cosineSim(cEmb, sEmb);
         if (sim > maxRedundancy) maxRedundancy = sim;
       }
 
-      // MMR score: λ * relevance - (1-λ) * redundancy
       const score = lambda * relevance - (1 - lambda) * maxRedundancy;
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
@@ -247,9 +353,9 @@ function mmrRerank(chunks, queryEmbedding, topK = 5, lambda = 0.6) {
   return selected;
 }
 
-// ─── STEP 3: BUILD CONTEXT (token-aware) ─────────────────────────────────────
+// ─── STEP 7: BUILD CONTEXT (token-aware) ─────────────────────────────────────
 
-const MAX_CONTEXT_CHARS = 3000; // ~750 tokens — safe for Groq 8k context
+const MAX_CONTEXT_CHARS = 6000; // ~1500 tokens — safe for 70b model's 32k context
 
 function buildContext(chunks) {
   // Deduplicate by doc_id — keep highest similarity chunk per document
@@ -262,17 +368,17 @@ function buildContext(chunks) {
   }
 
   const deduped = [...seen.values()];
-  const parts = [];
+  const parts   = [];
   let totalChars = 0;
 
   for (let i = 0; i < deduped.length; i++) {
-    const c = deduped[i];
-    const simPct = c.similarity !== undefined ? ` (${(c.similarity * 100).toFixed(0)}% match)` : '';
-    const header = `[${i + 1}] ${c.title}${simPct}`;
-    // Truncate chunk content to fit budget
-    const remaining = MAX_CONTEXT_CHARS - totalChars - header.length - 10;
-    if (remaining < 100) break;
-    const body = c.content.slice(0, remaining);
+    const c       = deduped[i];
+    const simPct  = c.similarity !== undefined ? ` (${(c.similarity * 100).toFixed(0)}% match)` : '';
+    const source  = c.source ? ` | Source: ${c.source}` : '';
+    const header  = `[${i + 1}] ${c.title}${simPct}${source}`;
+    const budget  = MAX_CONTEXT_CHARS - totalChars - header.length - 10;
+    if (budget < 100) break;
+    const body  = c.content.slice(0, budget);
     const entry = `${header}\n${body}`;
     parts.push(entry);
     totalChars += entry.length;
@@ -281,31 +387,43 @@ function buildContext(chunks) {
   return parts.join('\n\n---\n\n');
 }
 
-// ─── STEP 4: LLM GENERATION (with conversation history) ──────────────────────
+// ─── STEP 8: LLM GENERATION ──────────────────────────────────────────────────
 
 async function generateWithGroq(userQuery, chunks, history = []) {
   const context = buildContext(chunks);
 
-  const systemPrompt = `You are MedAssist AI, a knowledgeable and empathetic medical health assistant.
-You are given retrieved medical knowledge chunks found via semantic vector search (RAG).
-Use ONLY the information in the provided context to answer the user's question.
-Be clear, concise, and structured. Use markdown formatting (bold, bullet points).
-Always end with a disclaimer reminding the user to consult a qualified healthcare professional.
-Do NOT make up information not present in the context.
-If the context does not contain enough information, say so honestly.`;
+  const systemPrompt = `You are MedAssist AI, a highly knowledgeable and empathetic medical health assistant powered by a RAG (Retrieval-Augmented Generation) system.
 
-  // Build messages with conversation history (last 4 turns max)
-  const historyMessages = history.slice(-4).map(h => ({
+INSTRUCTIONS:
+1. THINK STEP BY STEP before answering. Internally reason about the symptoms, possible conditions, and relevant information from the context.
+2. Use ONLY the information in the provided medical knowledge context. Do NOT hallucinate or invent facts.
+3. Structure your response clearly using markdown:
+   - Start with a brief summary of what the user is experiencing
+   - List possible conditions or explanations
+   - Provide actionable advice and precautions
+   - Mention when to seek immediate medical attention
+4. Be specific and detailed — the user deserves a thorough, helpful answer.
+5. If the context is insufficient, say so honestly and suggest consulting a doctor.
+6. ALWAYS end with: "⚠️ This information is for educational purposes only. Please consult a qualified healthcare professional for proper diagnosis and treatment."
+
+TONE: Warm, clear, professional. Avoid jargon unless explained.`;
+
+  // Include last 6 turns of conversation history for better context continuity
+  const historyMessages = history.slice(-6).map(h => ({
     role: h.role,
-    content: h.content.slice(0, 300), // truncate old messages
+    content: h.content.slice(0, 500),
   }));
 
-  const userPrompt = `Retrieved medical knowledge (via vector similarity search):
+  const userPrompt = `## Retrieved Medical Knowledge (via hybrid vector + keyword search)
+
 ${context}
 
-User question: "${userQuery}"
+---
 
-Based on the retrieved context above, provide a helpful, structured medical response.`;
+## User Question
+"${userQuery}"
+
+Based on the retrieved medical knowledge above, provide a comprehensive, structured, and helpful response. Think through the symptoms and conditions carefully before answering.`;
 
   const chat = await groq.chat.completions.create({
     model: GROQ_MODEL,
@@ -314,8 +432,9 @@ Based on the retrieved context above, provide a helpful, structured medical resp
       ...historyMessages,
       { role: 'user', content: userPrompt },
     ],
-    temperature: 0.3,
-    max_tokens: 700,
+    temperature: 0.2,   // lower = more factual, less creative
+    max_tokens: 1200,   // more room for detailed answers
+    top_p: 0.9,
   });
 
   return chat.choices[0]?.message?.content?.trim() || null;
@@ -326,12 +445,11 @@ Based on the retrieved context above, provide a helpful, structured medical resp
 function extractMetadata(chunks) {
   const conditions = [...new Set(
     chunks
-      .filter(c => c.category === 'disease')
-      .slice(0, 3)
+      .filter(c => c.category === 'disease' || c.category === 'qa')
+      .slice(0, 4)
       .map(c => c.title)
   )];
 
-  // Extract precautions from chunk content
   const suggestedActions = [];
   for (const chunk of chunks) {
     const precMatch = chunk.content.match(/Precautions?:\s*(.+?)(?:\n|$)/i);
@@ -339,7 +457,7 @@ function extractMetadata(chunks) {
       const precs = precMatch[1].split(/[,;]/).map(p => p.trim()).filter(p => p.length > 5);
       suggestedActions.push(...precs.slice(0, 2));
     }
-    if (suggestedActions.length >= 3) break;
+    if (suggestedActions.length >= 4) break;
   }
   suggestedActions.push('Consult a doctor for proper diagnosis');
   suggestedActions.push('Monitor and document your symptoms');
@@ -372,16 +490,25 @@ export async function ragQuery(userMessage, history = []) {
     };
   }
 
-  // ── STEP 1: Rewrite + Embed query ──
+  // ── STEP 1+2: Rewrite + Embed query ──
   const queryEmbedding = await embedQuery(userMessage);
 
-  // ── STEP 2: Retrieve top-k chunks via vector search ──
-  const rawChunks = await retrieveChunks(queryEmbedding, 12); // fetch more for re-ranking
+  // ── STEP 3: Hybrid retrieval (vector + keyword in parallel) ──
+  const [vectorChunks, keywordChunks] = await Promise.all([
+    vectorRetrieve(queryEmbedding, 15),
+    keywordRetrieve(userMessage, 15),
+  ]);
 
-  // ── STEP 2b: MMR re-rank for diversity ──
-  const chunks = mmrRerank(rawChunks, queryEmbedding, 6, 0.65);
+  // ── STEP 4: Reciprocal Rank Fusion ──
+  const fusedChunks = reciprocalRankFusion([vectorChunks, keywordChunks]);
 
-  if (!chunks || chunks.length === 0) {
+  // ── STEP 5: Cross-encoder re-ranking ──
+  const reranked = rerank(fusedChunks, userMessage, 12);
+
+  // ── STEP 6: MMR for diversity ──
+  const finalChunks = mmrRerank(reranked, queryEmbedding, 6, 0.65);
+
+  if (!finalChunks || finalChunks.length === 0) {
     return {
       content: `I wasn't able to find relevant information for: "${userMessage}"\n\nPlease consult a qualified healthcare professional for proper evaluation.\n\n⚠️ *This is not a medical diagnosis.*`,
       conditions: ['Requires Medical Evaluation'],
@@ -390,28 +517,121 @@ export async function ragQuery(userMessage, history = []) {
     };
   }
 
-  // ── STEP 3 & 4: Build context + Generate with Groq (+ history) ──
+  // ── DETAILED RAG SCORING AND LOGGING ──
+  console.log('\n🧠 ===== RAG PIPELINE DETAILED RESULTS =====');
+  console.log(`📊 Pipeline Stats: ${vectorChunks.length} vector + ${keywordChunks.length} keyword → ${fusedChunks.length} fused → ${reranked.length} reranked → ${finalChunks.length} final`);
+  
+  // Log top vector results with scores
+  console.log('\n🔍 TOP VECTOR SEARCH RESULTS:');
+  vectorChunks.slice(0, 3).forEach((chunk, i) => {
+    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 60)}...`);
+    console.log(`     Source: ${chunk.source} | Category: ${chunk.category}`);
+  });
+  
+  // Log top keyword results
+  console.log('\n🔤 TOP KEYWORD SEARCH RESULTS:');
+  keywordChunks.slice(0, 3).forEach((chunk, i) => {
+    console.log(`  ${i + 1}. [${(chunk.similarity * 100).toFixed(1)}%] ${chunk.title?.slice(0, 60)}...`);
+    console.log(`     Source: ${chunk.source} | Category: ${chunk.category}`);
+  });
+  
+  // Log RRF scores
+  console.log('\n🔄 RECIPROCAL RANK FUSION SCORES:');
+  fusedChunks.slice(0, 3).forEach((chunk, i) => {
+    console.log(`  ${i + 1}. [RRF: ${chunk.rrfScore?.toFixed(4)}] ${chunk.title?.slice(0, 60)}...`);
+  });
+  
+  // Log final re-ranked results with all scores
+  console.log('\n🎯 FINAL RE-RANKED RESULTS:');
+  finalChunks.forEach((chunk, i) => {
+    const vectorSim = chunk.similarity ? (chunk.similarity * 100).toFixed(1) : 'N/A';
+    const rrfScore = chunk.rrfScore ? chunk.rrfScore.toFixed(4) : 'N/A';
+    const rerankScore = chunk.rerankScore ? (chunk.rerankScore * 100).toFixed(1) : 'N/A';
+    
+    console.log(`  ${i + 1}. "${chunk.title?.slice(0, 50)}..."`);
+    console.log(`     📈 Vector: ${vectorSim}% | RRF: ${rrfScore} | Rerank: ${rerankScore}%`);
+    console.log(`     📚 Source: ${chunk.source} | Category: ${chunk.category}`);
+    console.log(`     📄 Content: ${chunk.content?.slice(0, 100)}...`);
+    console.log('');
+  });
+  
+  console.log('🤖 ===== LLM GENERATION PHASE =====');
+
+  // ── STEP 7+8: Build context + Generate with Groq ──
   let content = null;
+  let generationStats = {
+    model: GROQ_MODEL,
+    contextLength: 0,
+    tokensUsed: 0,
+    responseTime: 0
+  };
+  
   try {
-    content = await generateWithGroq(userMessage, chunks, history);
+    const startTime = Date.now();
+    const context = buildContext(finalChunks);
+    generationStats.contextLength = context.length;
+    
+    console.log(`📝 Context built: ${context.length} characters (~${Math.round(context.length / 4)} tokens)`);
+    console.log(`🚀 Generating with ${GROQ_MODEL}...`);
+    
+    content = await generateWithGroq(userMessage, finalChunks, history);
+    
+    const endTime = Date.now();
+    generationStats.responseTime = endTime - startTime;
+    generationStats.tokensUsed = Math.round((context.length + (content?.length || 0)) / 4);
+    
+    console.log(`✅ Generation complete in ${generationStats.responseTime}ms`);
+    console.log(`📊 Estimated tokens used: ${generationStats.tokensUsed}`);
+    console.log(`📤 Response length: ${content?.length || 0} characters`);
+    
   } catch (err) {
-    console.error('[Groq] Generation failed:', err.message);
+    console.error('❌ [Groq] Generation failed:', err.message);
+    generationStats.error = err.message;
   }
 
   // Fallback if Groq fails
   if (!content) {
-    const topChunk = chunks[0];
-    content = `Based on your symptoms, this may be related to **${topChunk.title}**.\n\n${topChunk.content.slice(0, 400)}...\n\n⚠️ *This is not a medical diagnosis. Please consult a qualified healthcare professional.*`;
+    const topChunk = finalChunks[0];
+    content = `Based on your symptoms, this may be related to **${topChunk.title}**.\n\n${topChunk.content.slice(0, 500)}...\n\n⚠️ *This is not a medical diagnosis. Please consult a qualified healthcare professional.*`;
   }
 
-  const { conditions, suggestedActions } = extractMetadata(chunks);
+  const { conditions, suggestedActions } = extractMetadata(finalChunks);
 
-  return {
+  // Prepare detailed response with RAG metadata
+  const response = {
     content,
     conditions,
     suggestedActions,
     severity,
     affectedAreas: areas,
     isEmergency: false,
+    // RAG Pipeline Metadata
+    ragMetadata: {
+      pipelineStats: {
+        vectorResults: vectorChunks.length,
+        keywordResults: keywordChunks.length,
+        fusedResults: fusedChunks.length,
+        rerankedResults: reranked.length,
+        finalResults: finalChunks.length
+      },
+      topSources: finalChunks.map(chunk => ({
+        title: chunk.title,
+        source: chunk.source,
+        category: chunk.category,
+        vectorScore: chunk.similarity ? (chunk.similarity * 100).toFixed(1) : null,
+        rrfScore: chunk.rrfScore ? chunk.rrfScore.toFixed(4) : null,
+        rerankScore: chunk.rerankScore ? (chunk.rerankScore * 100).toFixed(1) : null
+      })),
+      generationStats,
+      queryExpansion: rewriteQuery(userMessage) !== userMessage ? rewriteQuery(userMessage) : null
+    }
   };
+  
+  console.log('\n🎉 ===== RAG PIPELINE COMPLETE =====');
+  console.log(`📋 Final Response: ${content?.slice(0, 100)}...`);
+  console.log(`🏥 Conditions: ${conditions.join(', ')}`);
+  console.log(`⚠️  Severity: ${severity}`);
+  console.log('=======================================\n');
+
+  return response;
 }

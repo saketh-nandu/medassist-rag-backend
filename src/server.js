@@ -6,7 +6,7 @@
  *   - Express
  *   - Supabase pgvector (11,458 embedded chunks)
  *   - all-MiniLM-L6-v2 for query embedding (via @xenova/transformers)
- *   - Groq llama-3.1-8b-instant for generation
+ *   - Groq llama-3.3-70b-versatile for generation
  */
 
 import express from 'express';
@@ -43,7 +43,7 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     status: 'ok',
-    mode: 'pgvector + all-MiniLM-L6-v2 + Groq llama-3.1-8b-instant',
+    mode: 'pgvector + all-MiniLM-L6-v2 + Groq llama-3.3-70b-versatile (hybrid RAG)',
     chunks: count || 0,
   });
 });
@@ -51,7 +51,13 @@ app.get('/api/health', async (_req, res) => {
 // ─── CHAT ─────────────────────────────────────────────────────────────────────
 
 app.post('/api/chat', async (req, res) => {
+  const startTime = Date.now();
   const { message, history = [] } = req.body;
+
+  console.log('\n🚀 ===== NEW RAG REQUEST =====');
+  console.log(`📝 User Query: "${message}"`);
+  console.log(`📚 History Length: ${history?.length || 0} messages`);
+  console.log(`⏰ Timestamp: ${new Date().toISOString()}`);
 
   if (!message || typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: 'message is required' });
@@ -62,9 +68,30 @@ app.post('/api/chat', async (req, res) => {
 
   try {
     const response = await ragQuery(message.trim(), history);
-    res.json(response);
+    
+    const processingTime = Date.now() - startTime;
+    
+    console.log(`⚡ Total Processing Time: ${processingTime}ms`);
+    console.log(`📤 Response Size: ${JSON.stringify(response).length} bytes`);
+    console.log('=======================================\n');
+    
+    res.json({
+      ...response,
+      metadata: {
+        processingTime,
+        timestamp: new Date().toISOString(),
+        version: '1.0.0'
+      }
+    });
   } catch (err) {
-    console.error('Chat error:', err.message);
+    const processingTime = Date.now() - startTime;
+    
+    console.error('❌ ===== RAG REQUEST FAILED =====');
+    console.error(`💥 Error: ${err.message}`);
+    console.error(`⏱️  Failed after: ${processingTime}ms`);
+    console.error(`📍 Stack: ${err.stack}`);
+    console.error('=======================================\n');
+    
     res.status(500).json({
       content: 'An error occurred. Please try again or consult a doctor directly.',
       conditions: [],
@@ -72,6 +99,11 @@ app.post('/api/chat', async (req, res) => {
       severity: 'low',
       affectedAreas: [],
       isEmergency: false,
+      metadata: {
+        processingTime,
+        timestamp: new Date().toISOString(),
+        error: true
+      }
     });
   }
 });
