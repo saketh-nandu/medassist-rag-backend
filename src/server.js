@@ -177,9 +177,10 @@ app.post('/api/search', async (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, async () => {
-  console.log(`\n🏥 MedAssist RAG Backend`);
+  console.log(`\n🏥 MedAssist RAG Backend v2.0`);
   console.log(`   http://localhost:${PORT}`);
-  console.log(`   Mode: pgvector + MiniLM + Groq\n`);
+  console.log(`   Mode: pgvector + MiniLM + Groq`);
+  console.log(`   Model Evaluation: Available\n`);
 
   // Warm up embedding model in background (downloads once, ~25MB)
   console.log('[Startup] Warming up embedding model...');
